@@ -1,0 +1,64 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+    restart: no
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    command: >
+      sh -c "
+        apk add --no-cache mysql-client redis curl &&
+        ./main &&
+        tail -f /dev/null
+      "
+    # Command explanation:
+    # 1. Install required packages
+    # 2. Run the main application
+    # 3. Keep container alive with tail
+
+  mysql:
+    image: mysql:5.7
+    environment:
+      MYSQL_ROOT_PASSWORD: password
+      MYSQL_DATABASE: dist_lock
+      MYSQL_USER: app_user
+      MYSQL_PASSWORD: app_password      
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "3306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "app_user", "--password=app_password"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  test:
+    image: alpine:latest
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ["sh", "-c", "apk add --no-cache mysql-client redis && redis-cli -h redis ping && mysql -h mysql -u app_user -papp_password dist_lock -e 'SHOW TABLES;' && tail -f /dev/null"]

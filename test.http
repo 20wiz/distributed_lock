@@ -1,0 +1,17 @@
+@host = http://localhost:8080
+
+### Root endpoint
+GET {{host}}/
+
+### Health check
+GET {{host}}/health
+
+### Status check
+GET {{host}}/status
+
+### Increment counter
+GET {{host}}/increment
+
+# Use Ctrl+Alt+R to run all requests
+# Use Ctrl+Alt+C to generate curl commands
+
