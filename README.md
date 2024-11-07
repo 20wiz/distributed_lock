@@ -1,23 +1,38 @@
 # Distributed Lock Demo
 
-This project demonstrates the use of distributed locks with Redis and MySQL in a Go application. It uses the `redsync` library for distributed locking.
+A Go-based web application demonstrating the use of Redis-based distributed locks using Redsync. The application features a counter that can be incremented concurrently by multiple instances while ensuring consistency through distributed locking.
 
-## Project Structure
+## Features
 
+- **Distributed Locking:** Ensure that only one instance can modify the counter at a time using Redis and Redsync.
+- **Web Interface:** Simple frontend with buttons to lock/unlock the counter and display its current status.
+- **Worker Simulation:** Simulated workers that periodically increment the counter.
+
+## Table of Contents
+
+- [Prerequisites](#prerequisites)
+- [Setup and Installation](#setup-and-installation)
+- [Running the Application](#running-the-application)
+- [Endpoints](#endpoints)
+- [Code Overview](#code-overview)
+- [Frontend](#frontend)
+- [Testing](#testing)
+- [Dependencies](#dependencies)
+- [License](#license)
 
 ## Prerequisites
 
-- Docker
-- Docker Compose
+- [Docker](https://www.docker.com/get-started) installed on your machine.
+- [Docker Compose](https://docs.docker.com/compose/install/) installed.
 
-## Setup
+## Setup and Installation
 
-1. Clone the repository:
+1. **Clone the Repository:**
 
-    ```sh
-    git clone https://github.com/20wiz/distributed_lock.git
-    cd distributed_lock
-    ```
+   ```bash
+   git clone https://github.com/20wiz/distributed_lock.git
+   cd distributed_lock
+   ```
 
 2. Build and run the Docker containers:
 
@@ -25,7 +40,7 @@ This project demonstrates the use of distributed locks with Redis and MySQL in a
     docker-compose up --build
     ```
 
-3. The application will be available at `http://localhost:8080`.
+3. The application will be available at `http://localhost:8080` and `http://localhost:8081` .
 
 ## Endpoints
 
