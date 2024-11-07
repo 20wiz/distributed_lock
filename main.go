@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	goredis "github.com/go-redis/redis/v8"
 	"github.com/go-redsync/redsync/v4"
 	"github.com/go-redsync/redsync/v4/redis/redigo"
@@ -19,14 +20,12 @@ import (
 	"golang.org/x/net/context"
 )
 
-// Add port to environment variables
 var (
 	db          *sql.DB
 	rdb         *goredis.Client
 	ctx         = context.Background()
 	rs          *redsync.Redsync
 	lock        *redsync.Mutex
-	lockMu      sync.Mutex
 	isPaused    bool
 	pauseLock   sync.Mutex
 	containerID string
@@ -45,12 +44,14 @@ func init() {
 	if appPort == "" {
 		appPort = "8080"
 	}
-	localPort = "8080"
+	localPort = os.Getenv("LOCAL_PORT")
+	if localPort == "" {
+		localPort = "8080"
+	}
 }
 
 func initDB() {
 	var err error
-	// Try localhost first, fallback to container name
 	hosts := []string{"localhost", "mysql"}
 
 	for _, host := range hosts {
@@ -97,11 +98,60 @@ func initRedis() {
 	log.Fatal("Could not connect to Redis")
 }
 
-func incrementHandler(w http.ResponseWriter, r *http.Request) {
-	// Try to get worker ID from URL param first, then header
-	workerID := r.URL.Query().Get("worker")
+// LockHandler attempts to acquire the distributed lock
+func lockHandler(c *gin.Context) {
+	if err := lock.Lock(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "failed to acquire lock", "error": err.Error()})
+		return
+	}
+
+	// Set a Redis key to indicate lock status
+	if err := rdb.SetNX(ctx, "lock_status", "locked", 0).Err(); err != nil {
+		log.Printf("Failed to set lock_status: %v", err)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "locked"})
+}
+
+// UnlockHandler releases the distributed lock
+func unlockHandler(c *gin.Context) {
+	if ok, err := lock.Unlock(); !ok || err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "failed to release lock", "error": err.Error()})
+		return
+	}
+
+	// Remove the Redis key indicating lock status
+	if err := rdb.Del(ctx, "lock_status").Err(); err != nil {
+		log.Printf("Failed to delete lock_status: %v", err)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "unlocked"})
+}
+
+// LockStatusHandler checks the current lock status
+func lockStatusHandler(c *gin.Context) {
+	status, err := rdb.Get(ctx, "lock_status").Result()
+	if err == goredis.Nil {
+		status = "unlocked"
+	} else if err != nil {
+		log.Printf("Failed to get lock_status: %v", err)
+		status = "unknown"
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": status})
+}
+
+func incrementHandler(c *gin.Context) {
+	// Check if the lock is held
+	status, err := rdb.Get(ctx, "lock_status").Result()
+	if err == nil && status == "locked" {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Service is locked"})
+		return
+	}
+
+	workerID := c.Query("worker")
 	if workerID == "" {
-		workerID = r.Header.Get("X-Worker-ID")
+		workerID = c.GetHeader("X-Worker-ID")
 	}
 	if workerID == "" {
 		workerID = "unknown"
@@ -113,8 +163,8 @@ func incrementHandler(w http.ResponseWriter, r *http.Request) {
 	pauseLock.Lock()
 	if isPaused {
 		pauseLock.Unlock()
-		log.Printf("[%s] Service is paused", containerID)
-		http.Error(w, "Service is paused", http.StatusServiceUnavailable)
+		log.Printf("[%s-Worker%s] Service is paused", containerID, workerID)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Service is paused"})
 		return
 	}
 	pauseLock.Unlock()
@@ -129,64 +179,112 @@ func incrementHandler(w http.ResponseWriter, r *http.Request) {
 
 		if err := mutex.Lock(); err != nil {
 			if i == maxRetries-1 {
-				log.Printf("[%s] Failed to acquire lock after %d attempts: %v", containerID, maxRetries, err)
-				http.Error(w, "Too many requests, please try again later", http.StatusTooManyRequests)
+				log.Printf("[%s-Worker%s] Failed to acquire lock after %d attempts: %v",
+					containerID, workerID, maxRetries, err)
+				c.JSON(http.StatusTooManyRequests, gin.H{"error": "Too many requests, please try again later"})
 				return
 			}
 			waitTime := time.Duration(math.Pow(2, float64(i))) * 100 * time.Millisecond
-			log.Printf("[%s] Retry %d: waiting %v before next attempt", containerID, i+1, waitTime)
+			log.Printf("[%s-Worker%s] Retry %d: waiting %v before next attempt",
+				containerID, workerID, i+1, waitTime)
 			time.Sleep(waitTime)
 			continue
 		}
 
 		defer mutex.Unlock()
-		log.Printf("[%s] Lock acquired", containerID)
+		log.Printf("[%s-Worker%s] Lock acquired", containerID, workerID)
 
 		// Artificial delay
-		time.Sleep(time.Duration(200+rand.Intn(200)) * time.Millisecond)
+		time.Sleep(time.Duration(100+rand.Intn(100)) * time.Millisecond)
 
-		tx, err := db.BeginTx(ctx, nil)
+		tx, err := db.BeginTx(ctx, nil) // db transaction also locks the row, not required for this example
 		if err != nil {
-			http.Error(w, "Could not start transaction", http.StatusInternalServerError)
+			log.Printf("[%s-Worker%s] Could not start transaction: %v", containerID, workerID, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Could not start transaction"})
 			return
 		}
 		defer tx.Rollback()
 
 		// Get latest value
 		var currentValue int
-		err = tx.QueryRowContext(ctx, "SELECT count FROM counter ORDER BY id DESC LIMIT 1").Scan(&currentValue)
+		err = tx.QueryRowContext(ctx, "SELECT counter_value FROM counter ORDER BY id DESC LIMIT 1").Scan(&currentValue)
 		if err != nil {
-			http.Error(w, "Could not read current count", http.StatusInternalServerError)
+			log.Printf("[%s-Worker%s] Could not read current value: %v", containerID, workerID, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Could not read current value"})
 			return
 		}
 
 		// Insert new row with incremented value
 		newValue := currentValue + 1
 		_, err = tx.ExecContext(ctx,
-			"INSERT INTO counter (count, last_updated_by) VALUES (?, ?)",
+			"INSERT INTO counter (counter_value, last_updated_by) VALUES (?, ?)",
 			newValue, updatedBy)
 		if err != nil {
-			http.Error(w, "Could not insert new count", http.StatusInternalServerError)
+			log.Printf("[%s-Worker%s] Could not insert new value: %v", containerID, workerID, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Could not insert new value"})
 			return
 		}
 
 		if err := tx.Commit(); err != nil {
-			http.Error(w, "Could not commit transaction", http.StatusInternalServerError)
+			log.Printf("[%s-Worker%s] Could not commit transaction: %v", containerID, workerID, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Could not commit transaction"})
 			return
 		}
 
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"update_by": "%s_%s", "previous_count": %d, "new_count": %d}`,
-			containerID, workerID, currentValue, newValue)
+		c.JSON(http.StatusOK, gin.H{
+			"container":      containerID,
+			"worker":         workerID,
+			"previous_value": currentValue,
+			"new_value":      newValue,
+		})
 		return
 	}
 }
 
-func pauseHandler(w http.ResponseWriter, r *http.Request) {
+func getCurrentCounterHandler(c *gin.Context) {
+	var counterValue int
+	var updatedBy string
+	var createdAt []uint8
+
+	err := db.QueryRow("SELECT counter_value, last_updated_by, created_at FROM counter ORDER BY id DESC LIMIT 1").
+		Scan(&counterValue, &updatedBy, &createdAt)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			log.Printf("No counter records found")
+			// Return initial state if no records
+			c.JSON(http.StatusOK, gin.H{
+				"counter_value": 0,
+				"updated_by":    "none",
+				"updated_at":    time.Now().Format(time.RFC3339),
+			})
+			return
+		}
+		log.Printf("Error reading counter value: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Could not read counter value"})
+		return
+	}
+
+	// Convert createdAt to time.Time
+	createdAtTime, err := time.Parse("2006-01-02 15:04:05", string(createdAt))
+	if err != nil {
+		log.Printf("Error parsing created_at: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Could not parse created_at"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"counter_value": counterValue,
+		"updated_by":    updatedBy,
+		"updated_at":    createdAtTime.Format(time.RFC3339),
+	})
+}
+
+func pauseHandler(c *gin.Context) {
 	pauseLock.Lock()
 	defer pauseLock.Unlock()
 	isPaused = !isPaused
-	fmt.Fprintf(w, `{"paused": %v}`, isPaused)
+	c.JSON(http.StatusOK, gin.H{"paused": isPaused})
 }
 
 func startIncrementLoop() {
@@ -226,150 +324,30 @@ func startIncrementLoop() {
 	}
 }
 
-func healthHandler(w http.ResponseWriter, r *http.Request) {
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "healthy")
-}
-
-func statusHandler(w http.ResponseWriter, r *http.Request) {
-	// Check DB
-	err := db.Ping()
-	dbStatus := "up"
-	if err != nil {
-		dbStatus = "down"
-	}
-
-	// Check Redis
-	_, err = rdb.Ping(ctx).Result()
-	redisStatus := "up"
-	if err != nil {
-		redisStatus = "down"
-	}
-
-	fmt.Fprintf(w, "Database: %s\nRedis: %s", dbStatus, redisStatus)
-}
-
-func lockStatusHandler(w http.ResponseWriter, r *http.Request) {
-	val, err := rdb.Get(ctx, "counter_lock").Result()
-	if err != nil {
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, "Lock is free")
-		return
-	}
-
-	ttl, _ := rdb.TTL(ctx, "counter_lock").Result()
-	fmt.Fprintf(w, "Lock is held. TTL: %v\nValue: %s", ttl, val)
-}
-
-func getCurrentCounterHandler(w http.ResponseWriter, r *http.Request) {
-	var count int
-	var updatedBy string
-	// var updatedAt time.Time
-	var createdAt []uint8
-
-	err := db.QueryRow("SELECT count, last_updated_by, created_at FROM counter ORDER BY id DESC LIMIT 1").
-		Scan(&count, &updatedBy, &createdAt)
-
-	if err != nil {
-		if err == sql.ErrNoRows {
-			log.Printf("No counter records found")
-			// Return initial state if no records
-			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprintf(w, `{"count": 0, "updated_by": "none", "updated_at": "%s"}`,
-				time.Now().Format(time.RFC3339))
-			return
-		}
-		log.Printf("Error reading counter count: %v", err)
-		http.Error(w, "Could not read count", http.StatusInternalServerError)
-		return
-	}
-
-	// Convert createdAt to time.Time
-	createdAtTime, err := time.Parse("2006-01-02 15:04:05", string(createdAt))
-	if err != nil {
-		log.Printf("Error parsing created_at: %v", err)
-		http.Error(w, "Could not parse created_at", http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprintf(w, `{"count": %d, "updated_by": "%s", "updated_at": "%s"}`,
-		count, updatedBy, createdAtTime.Format(time.RFC3339))
-}
-
-func rootHandler(w http.ResponseWriter, r *http.Request) {
-	html := `
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Distributed Lock Demo</title>
-    <style>
-        body { font-family: Arial; margin: 40px; }
-        .counter {
-            font-size: 48px;
-            margin: 20px 0;
-        }
-        .container {
-            text-align: center;
-        }
-        .info {
-            color: #666;
-            font-size: 14px;
-        }
-        .error {
-            color: #ff0000;
-            margin: 10px 0;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Counter Value</h1>
-        <div class="counter" id="counterValue">0</div>
-        <div class="info" id="lastUpdated"></div>
-        <div class="error" id="errorMsg"></div>
-    </div>
-
-    <script>
-    async function updateCounter() {
-        try {
-            const response = await fetch('/counter');
-            const data = await response.json();
-            document.getElementById('counterValue').textContent = data.count;
-            document.getElementById('lastUpdated').textContent = 
-                'Last updated by: ' + data.updated_by + 
-                ' at ' + new Date(data.updated_at).toLocaleTimeString();
-            document.getElementById('errorMsg').textContent = '';
-        } catch (err) {
-            document.getElementById('errorMsg').textContent = 'Error: ' + err.message;
-        }
-    }
-
-    // Update every second
-    setInterval(updateCounter, 1000);
-    // Initial update
-    updateCounter();
-    </script>
-</body>
-</html>
-`
-	w.Header().Set("Content-Type", "text/html")
-	fmt.Fprint(w, html)
-}
-
 func main() {
 	initDB()
 	initRedis()
 
-	http.HandleFunc("/", rootHandler)
-	http.HandleFunc("/health", healthHandler)
-	http.HandleFunc("/status", statusHandler)
-	http.HandleFunc("/increment", incrementHandler)
-	http.HandleFunc("/lock-status", lockStatusHandler)
-	http.HandleFunc("/pause", pauseHandler)
-	http.HandleFunc("/counter", getCurrentCounterHandler)
+	r := gin.Default()
+	r.LoadHTMLFiles("static/index.html")
+	r.Static("/static", "./static")
+
+	r.GET("/", func(c *gin.Context) {
+		c.HTML(http.StatusOK, "index.html", nil)
+	})
+	// r.GET("/health", healthHandler)
+	// r.GET("/status", statusHandler)
+	r.GET("/increment", incrementHandler)
+	r.GET("/lock-status", lockStatusHandler)
+	r.GET("/lock", lockHandler)
+	r.GET("/unlock", unlockHandler)
+	r.GET("/counter", getCurrentCounterHandler)
+	r.GET("/pause", pauseHandler)
+
 	startIncrementLoop()
 
 	log.Printf("Server starting on :" + localPort)
-	log.Fatal(http.ListenAndServe(":"+localPort, nil))
+	if err := r.Run(":" + localPort); err != nil {
+		log.Fatalf("Failed to run server: %v", err)
+	}
 }

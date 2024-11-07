@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Distributed Lock Demo</title>
+    <style>
+        body { font-family: Arial; margin: 40px; }
+        .counter {
+            font-size: 48px;
+            margin: 20px 0;
+        }
+        .container {
+            text-align: center;
+        }
+        .info {
+            color: #666;
+            font-size: 14px;
+        }
+        .error {
+            color: #ff0000;
+            margin: 10px 0;
+        }
+        button {
+            padding: 10px 20px;
+            margin: 5px;
+            cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Counter Value</h1>
+        <div class="counter" id="counterValue">0</div>
+        <div class="info" id="lastUpdated"></div>
+        <div class="error" id="errorMsg"></div>
+        <div>
+            <button onclick="lock()">Lock</button>
+            <button onclick="unlock()">Unlock</button>
+        </div>
+        <div class="info" id="lockStatus">Lock Status: Unknown</div>
+    </div>
+
+    <script>
+    async function updateCounter() {
+        try {
+            const response = await fetch('/counter');
+            const data = await response.json();
+            document.getElementById('counterValue').textContent = data.counter_value;
+            document.getElementById('lastUpdated').textContent = 
+                'Last updated by: ' + data.updated_by + 
+                ' at ' + new Date(data.updated_at).toLocaleTimeString();
+            document.getElementById('errorMsg').textContent = '';
+        } catch (err) {
+            document.getElementById('errorMsg').textContent = 'Error: ' + err.message;
+        }
+    }
+
+    async function updateLockStatus() {
+        try {
+            const response = await fetch('/lock-status');
+            const data = await response.json();
+            document.getElementById('lockStatus').textContent = 'Lock Status: ' + data.status;
+        } catch (err) {
+            document.getElementById('lockStatus').textContent = 'Lock Status: Error';
+        }
+    }
+
+    async function lock() {
+        try {
+            const response = await fetch('/lock');
+            const data = await response.json();
+            document.getElementById('lockStatus').textContent = 'Lock Status: ' + data.status;
+        } catch (err) {
+            document.getElementById('lockStatus').textContent = 'Lock Status: Error';
+        }
+    }
+
+    async function unlock() {
+        try {
+            const response = await fetch('/unlock');
+            const data = await response.json();
+            document.getElementById('lockStatus').textContent = 'Lock Status: ' + data.status;
+        } catch (err) {
+            document.getElementById('lockStatus').textContent = 'Lock Status: Error';
+        }
+    }
+
+    // Update every second
+    setInterval(updateCounter, 1000);
+    setInterval(updateLockStatus, 1000);
+    // Initial update
+    updateCounter();
+    updateLockStatus();
+    </script>
+</body>
+</html>
