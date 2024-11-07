@@ -27,39 +27,51 @@ var (
 
 func initDB() {
 	var err error
-	dsn := "app_user:app_password@tcp(mysql:3306)/dist_lock"
-	db, err = sql.Open("mysql", dsn)
-	if err != nil {
-		log.Fatalf("Error opening database: %v", err)
+	// Try localhost first, fallback to container name
+	hosts := []string{"localhost", "mysql"}
+
+	for _, host := range hosts {
+		dsn := fmt.Sprintf("app_user:app_password@tcp(%s:3306)/dist_lock", host)
+		db, err = sql.Open("mysql", dsn)
+		if err == nil {
+			if err = db.Ping(); err == nil {
+				log.Printf("Connected to MySQL at %s", host)
+				return
+			}
+		}
+		log.Printf("Failed to connect to MySQL at %s: %v", host, err)
 	}
-	if err = db.Ping(); err != nil {
-		log.Fatalf("Error connecting to the database: %v", err)
-	}
+	log.Fatal("Could not connect to MySQL")
 }
 
 func initRedis() {
-	client := goredis.NewClient(&goredis.Options{
-		Addr:        "redis:6379",
-		DialTimeout: time.Second * 5,
-	})
-	if _, err := client.Ping(ctx).Result(); err != nil {
-		log.Fatalf("Error connecting to Redis: %v", err)
-	}
-	rdb = client
+	var client *goredis.Client
+	hosts := []string{"localhost", "redis"}
 
-	pool := &redis.Pool{
-		MaxIdle:   3,
-		MaxActive: 64,
-		Dial: func() (redis.Conn, error) {
-			c, err := redis.Dial("tcp", "redis:6379")
-			if err != nil {
-				return nil, err
+	for _, host := range hosts {
+		client = goredis.NewClient(&goredis.Options{
+			Addr:        fmt.Sprintf("%s:6379", host),
+			DialTimeout: time.Second * 5,
+		})
+		if _, err := client.Ping(ctx).Result(); err == nil {
+			log.Printf("Connected to Redis at %s", host)
+			rdb = client
+
+			pool := &redis.Pool{
+				MaxIdle:   3,
+				MaxActive: 64,
+				Dial: func() (redis.Conn, error) {
+					return redis.Dial("tcp", fmt.Sprintf("%s:6379", host))
+				},
 			}
-			return c, err
-		},
+			rs = redsync.New(redigo.NewPool(pool))
+			lock = rs.NewMutex("myLock")
+			return
+		} else {
+			log.Printf("Failed to connect to Redis at %s: %v", host, err)
+		}
 	}
-	rs = redsync.New(redigo.NewPool(pool))
-	lock = rs.NewMutex("myLock")
+	log.Fatal("Could not connect to Redis")
 }
 
 func incrementHandler(w http.ResponseWriter, r *http.Request) {
@@ -110,7 +122,52 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func rootHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintf(w, "Distributed Lock Demo\nAvailable endpoints:\n/health\n/status\n/increment")
+	html := `
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Distributed Lock Demo</title>
+    <style>
+        body { font-family: Arial; margin: 40px; }
+        button { 
+            padding: 10px 20px;
+            margin: 5px;
+            cursor: pointer;
+        }
+        #response {
+            margin-top: 20px;
+            padding: 10px;
+            border: 1px solid #ccc;
+            min-height: 50px;
+        }
+    </style>
+</head>
+<body>
+    <h1>Distributed Lock Demo</h1>
+    <div>
+        <button onclick="fetchEndpoint('/health')">Health Check</button>
+        <button onclick="fetchEndpoint('/status')">Status</button>
+        <button onclick="fetchEndpoint('/increment')">Increment</button>
+    </div>
+    <div id="response"></div>
+
+    <script>
+    async function fetchEndpoint(path) {
+        const response = document.getElementById('response');
+        try {
+            const res = await fetch(path);
+            const text = await res.text();
+            response.innerHTML = ` + "`<pre>${text}</pre>`" + `;
+        } catch (err) {
+            response.innerHTML = ` + "`Error: ${err.message}`" + `;
+        }
+    }
+    </script>
+</body>
+</html>
+`
+	w.Header().Set("Content-Type", "text/html")
+	fmt.Fprint(w, html)
 }
 
 func main() {
